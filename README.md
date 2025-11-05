@@ -6,6 +6,20 @@ An R package for teaching Bayesian inference to PhD students, featuring comprehe
 
 This package provides educational materials for an introductory course on Bayesian statistics. The main vignette demonstrates a complete Bayesian workflow using an **SIR (Susceptible-Infected-Recovered) epidemic model**.
 
+## Background
+
+Introduction to MCMC
+
+* [The Strange Math That Predicts (Almost) Anything](https://www.youtube.com/watch?v=KZeIEiBrT_w) <- really good Veritasium vide on Markov chains
+* [Markov Chain Monte Carlo (MCMC) : Data Science Concepts](https://www.youtube.com/watch?v=yApmR-c_hKU) <- Good gentle introduction to MCMC
+* [MCMC &amp; the art of Sampling without Sampling](https://medium.com/data-science-collective/mcmc-the-art-of-sampling-without-sampling-7272697e5744) <- comprehensive, but a bit heavy, overview of MCMC
+
+Books on MCMC
+
+* **"Statistical Rethinking" by Richard McElreath (2nd edition, 2020).** This is widely considered the best modern introduction.
+* *A Student’s Guide to Bayesian Statistics by Ben Lambert.** Not quite as popular as Richard's, but very comprehensive for beginners.
+* **"Bayesian Data Analysis" by Gelman, Carlin, Stern, Dunson, Vehtari & Rubin (3rd edition, 2013).** The definitive comprehensive textbook.
+
 ## What You'll Learn
 
 - **Bayesian fundamentals**: Priors, likelihoods, and posterior distributions
@@ -71,17 +85,3 @@ Main packages used:
 - `deSolve`: Solving differential equations
 
 See `DESCRIPTION` for the complete list.
-
-## Background
-
-Introduction to MCMC
-
-* [The Strange Math That Predicts (Almost) Anything](https://www.youtube.com/watch?v=KZeIEiBrT_w) <- really good Veritasium vide on Markov chains
-* [Markov Chain Monte Carlo (MCMC) : Data Science Concepts](https://www.youtube.com/watch?v=yApmR-c_hKU) <- Good gentle introduction to MCMC
-* [MCMC &amp; the art of Sampling without Sampling](https://medium.com/data-science-collective/mcmc-the-art-of-sampling-without-sampling-7272697e5744) <- comprehensive, but a bit heavy, overview of MCMC
-
-Books on MCMC
-
-* **"Statistical Rethinking" by Richard McElreath (2nd edition, 2020).** This is widely considered the best modern introduction.
-* *A Student’s Guide to Bayesian Statistics by Ben Lambert.** Not quite as popular as Richard's, but very comprehensive for beginners.
-* **"Bayesian Data Analysis" by Gelman, Carlin, Stern, Dunson, Vehtari & Rubin (3rd edition, 2013).** The definitive comprehensive textbook.
