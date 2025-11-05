@@ -74,10 +74,14 @@ See `DESCRIPTION` for the complete list.
 
 ## Background
 
-Intro to Bayes theory
+Introduction to MCMC
 
-* 
+* [The Strange Math That Predicts (Almost) Anything](https://www.youtube.com/watch?v=KZeIEiBrT_w) <- really good Veritasium vide on Markov chains
+* [Markov Chain Monte Carlo (MCMC) : Data Science Concepts](https://www.youtube.com/watch?v=yApmR-c_hKU) <- Good gentle introduction to MCMC
+* [MCMC &amp; the art of Sampling without Sampling](https://medium.com/data-science-collective/mcmc-the-art-of-sampling-without-sampling-7272697e5744) <- comprehensive, but a bit heavy, overview of MCMC
 
-## "Author
+Books on MCMC
 
-Created for the CCHG PhD student Bayesian inference course.
+* **"Statistical Rethinking" by Richard McElreath (2nd edition, 2020).** This is widely considered the best modern introduction.
+* *A Student’s Guide to Bayesian Statistics by Ben Lambert.** Not quite as popular as Richard's, but very comprehensive for beginners.
+* **"Bayesian Data Analysis" by Gelman, Carlin, Stern, Dunson, Vehtari & Rubin (3rd edition, 2013).** The definitive comprehensive textbook.
