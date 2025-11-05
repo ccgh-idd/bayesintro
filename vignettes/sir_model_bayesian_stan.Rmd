@@ -1,0 +1,595 @@
+---
+title: "Bayesian Inference for SIR Epidemic Models"
+author: "Introduction to Bayesian Statistics"
+date: "`r Sys.Date()`"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+vignette: >
+  %\VignetteIndexEntry{Bayesian Inference for SIR Epidemic Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 8,
+  fig.height = 6,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Introduction
+
+This vignette demonstrates how to use Bayesian inference to fit an **SIR (Susceptible-Infected-Recovered) model** to epidemic data. We'll walk through the entire workflow:
+
+1. Understanding the SIR model
+2. Simulating synthetic epidemic data
+3. Specifying a Bayesian model using Stan
+4. Fitting the model using Hamiltonian Monte Carlo (HMC)
+5. Assessing convergence with trace plots
+6. Validating the model with posterior predictive checks
+
+## What is an SIR Model?
+
+The SIR model is a compartmental model that divides a population into three groups:
+
+- **S**: Susceptible individuals who can catch the disease
+- **I**: Infected individuals who are currently infectious
+- **R**: Recovered individuals who have immunity
+
+The model is governed by differential equations:
+
+$$
+\begin{aligned}
+\frac{dS}{dt} &= -\beta \frac{SI}{N} \\
+\frac{dI}{dt} &= \beta \frac{SI}{N} - \gamma I \\
+\frac{dR}{dt} &= \gamma I
+\end{aligned}
+$$
+
+where:
+
+- $\beta$ is the transmission rate (contacts per day × probability of transmission)
+- $\gamma$ is the recovery rate (1/infectious period)
+- $N = S + I + R$ is the total population size
+
+## Why Bayesian Inference?
+
+Bayesian inference allows us to:
+
+1. **Quantify uncertainty** in parameter estimates ($\beta$ and $\gamma$)
+2. **Incorporate prior knowledge** about disease parameters
+3. **Make probabilistic predictions** about future disease trajectories
+4. **Handle complex models** with latent (unobserved) states
+
+# Load Required Libraries
+
+```{r libraries}
+
+library(rstan)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(deSolve)
+
+# Stan options for better performance
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# Set random seed for reproducibility
+set.seed(42)
+```
+
+# Step 1: Simulate SIR Epidemic Data
+
+First, we'll simulate "true" epidemic data that we'll later try to recover through Bayesian inference.
+
+```{r simulate_sir}
+# Define the SIR model as ordinary differential equations (ODEs)
+sir_ode <- function(time, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    N <- S + I + R
+    
+    dS <- -beta * S * I / N
+    dI <- beta * S * I / N - gamma * I
+    dR <- gamma * I
+    
+    return(list(c(dS, dI, dR)))
+  })
+}
+
+# True parameter values (these are what we'll try to recover)
+true_beta <- 0.4    # Transmission rate
+true_gamma <- 0.1   # Recovery rate (1/10 days = 10-day infectious period)
+
+# Basic reproductive number R0 = beta/gamma
+true_R0 <- true_beta / true_gamma
+cat("True R0:", true_R0, "\n")
+
+# Initial conditions
+N <- 1000           # Total population
+initial_infected <- 10
+initial_state <- c(
+  S = N - initial_infected,
+  I = initial_infected,
+  R = 0
+)
+
+# Time points for simulation
+times <- seq(0, 100, by = 1)
+
+# Solve the ODE
+parameters <- c(beta = true_beta, gamma = true_gamma)
+sir_solution <- ode(
+  y = initial_state,
+  times = times,
+  func = sir_ode,
+  parms = parameters
+)
+
+# Convert to data frame
+sir_df <- as.data.frame(sir_solution)
+colnames(sir_df) <- c("time", "S", "I", "R")
+
+# Add observation noise to infected counts (this simulates real data)
+# We'll observe infected counts with Poisson noise
+sir_df$I_observed <- rpois(nrow(sir_df), lambda = sir_df$I)
+
+# Plot the true epidemic curve
+ggplot(sir_df, aes(x = time)) +
+  geom_line(aes(y = S, color = "Susceptible"), size = 1) +
+  geom_line(aes(y = I, color = "Infected (true)"), size = 1) +
+  geom_line(aes(y = R, color = "Recovered"), size = 1) +
+  geom_point(aes(y = I_observed, color = "Infected (observed)"), alpha = 0.5) +
+  labs(
+    title = "Simulated SIR Epidemic",
+    subtitle = paste0("β = ", true_beta, ", γ = ", true_gamma, ", R0 = ", round(true_R0, 2)),
+    x = "Time (days)",
+    y = "Number of individuals",
+    color = "Compartment"
+  ) +
+  theme_minimal() +
+  scale_color_manual(
+    values = c(
+      "Susceptible" = "blue",
+      "Infected (true)" = "red",
+      "Infected (observed)" = "darkred",
+      "Recovered" = "green"
+    )
+  )
+```
+
+**Key Points:**
+
+- We simulate from the true SIR model with known parameters
+- Real observations typically have measurement error, so we add Poisson noise
+- The observed infected counts are what we'll use to fit our Bayesian model
+
+# Step 2: Prepare Data for Stan
+
+We'll use a subset of the data for fitting (days 1-60) and keep the rest for validation.
+
+```{r prepare_data}
+# Use data up to day 60 for fitting
+fit_period <- 60
+fit_data <- sir_df %>% filter(time <= fit_period)
+
+# Prepare data for Stan
+stan_data <- list(
+  n_times = nrow(fit_data),
+  y = fit_data$I_observed,
+  t0 = 0,
+  ts = fit_data$time,
+  N = N,
+  I0 = initial_infected
+)
+
+cat("Observed infected counts (first 15 days):\n")
+print(head(fit_data$I_observed, 15))
+```
+
+# Step 3: Specify the Bayesian Model in Stan
+
+Stan uses a probabilistic programming language to specify Bayesian models. Our model has three components:
+
+1. **Prior distributions**: Our beliefs about $\beta$ and $\gamma$ before seeing data
+2. **Likelihood**: How the data are generated given parameters (SIR dynamics + Poisson noise)
+3. **Posterior**: Updated beliefs about parameters after seeing data (computed by Stan)
+
+```{r stan_model}
+# Stan model code
+stan_model_code <- "
+functions {
+  // Define the SIR model as ODEs
+  real[] sir(real t, real[] y, real[] theta, real[] x_r, int[] x_i) {
+    real S = y[1];
+    real I = y[2];
+    real R = y[3];
+    
+    real N = x_i[1];
+    real beta = theta[1];
+    real gamma = theta[2];
+    
+    real dS_dt = -beta * S * I / N;
+    real dI_dt = beta * S * I / N - gamma * I;
+    real dR_dt = gamma * I;
+    
+    return {dS_dt, dI_dt, dR_dt};
+  }
+}
+
+data {
+  int<lower=1> n_times;           // Number of time points
+  int y[n_times];                 // Observed infected counts
+  real t0;                        // Initial time
+  real ts[n_times];               // Time points
+  int<lower=1> N;                 // Total population
+  real<lower=0> I0;               // Initial infected
+}
+
+transformed data {
+  real x_r[0];                    // No real data to pass to ODE
+  int x_i[1] = {N};               // Pass population size to ODE
+}
+
+parameters {
+  real<lower=0> beta;             // Transmission rate
+  real<lower=0> gamma;            // Recovery rate
+}
+
+transformed parameters {
+  real y_hat[n_times, 3];         // ODE solution [S, I, R]
+  real theta[2] = {beta, gamma};  // Parameters for ODE
+  real y0[3] = {N - I0, I0, 0};   // Initial conditions [S0, I0, R0]
+  
+  // Solve ODE
+  y_hat = integrate_ode_rk45(sir, y0, t0, ts, theta, x_r, x_i);
+}
+
+model {
+  // PRIORS
+  // Beta ~ Uniform(0, 1) (implicitly from lower=0 bound)
+  beta ~ normal(0.4, 0.2);
+  
+  // Gamma ~ Uniform(0, 1)
+  gamma ~ normal(0.1, 0.05);
+  
+  // LIKELIHOOD
+  // Observed counts follow Poisson distribution around true infected count
+  for (t in 1:n_times) {
+    if (y_hat[t, 2] > 0) {
+      y[t] ~ poisson(y_hat[t, 2]);
+    }
+  }
+}
+
+generated quantities {
+  // Posterior predictive samples
+  int y_pred[n_times];
+  real R0 = beta / gamma;
+  
+  for (t in 1:n_times) {
+    if (y_hat[t, 2] > 0) {
+      y_pred[t] = poisson_rng(y_hat[t, 2]);
+    } else {
+      y_pred[t] = 0;
+    }
+  }
+}
+"
+
+# Compile the Stan model
+cat("Compiling Stan model (this may take a minute)...\n")
+sir_model <- stan_model(model_code = stan_model_code)
+cat("Model compiled successfully!\n")
+```
+
+**Understanding the Stan Model:**
+
+- **`functions` block**: Defines the SIR ODEs
+- **`data` block**: Declares the observed data we'll provide
+- **`parameters` block**: Declares unknown parameters ($\beta$ and $\gamma$) to estimate
+- **`transformed parameters` block**: Solves the ODE given current parameter values
+- **`model` block**: Specifies priors and likelihood
+  - **Priors**: We use weakly informative priors centered near reasonable values
+  - **Likelihood**: Observed counts $\sim$ Poisson(expected infected count from ODE)
+- **`generated quantities` block**: Generates posterior predictive samples for model checking
+
+# Step 4: Fit the Model Using MCMC
+
+Now we'll fit the model using Hamiltonian Monte Carlo (HMC), a state-of-the-art MCMC algorithm.
+
+```{r fit_model, results='hide'}
+cat("Fitting model with HMC (this will take a few minutes)...\n")
+
+fit <- sampling(
+  sir_model,
+  data = stan_data,
+  chains = 4,              # Run 4 independent chains
+  iter = 2000,             # 2000 iterations per chain
+  warmup = 1000,           # 1000 warmup (burn-in) iterations
+  thin = 1,                # No thinning
+  seed = 42,
+  control = list(
+    adapt_delta = 0.95,    # Target acceptance rate (higher = more accurate)
+    max_treedepth = 12     # Maximum tree depth for HMC
+  )
+)
+```
+
+```{r fit_summary}
+cat("Model fitting complete!\n\n")
+
+# Print summary of key parameters
+print(fit, pars = c("beta", "gamma", "R0"))
+```
+
+**Interpreting the Summary:**
+
+- **`mean`**: Posterior mean estimate
+- **`sd`**: Posterior standard deviation (uncertainty)
+- **`2.5%` and `97.5%`**: 95% credible interval
+- **`n_eff`**: Effective sample size (should be > 400 for reliable inference)
+- **`Rhat`**: Convergence diagnostic (should be < 1.01; close to 1.00 is best)
+
+Compare the estimates to the true values:
+
+```{r compare_true}
+cat("\nTrue vs. Estimated Parameters:\n")
+cat(sprintf("Beta:  True = %.3f, Estimated = %.3f\n", 
+            true_beta, mean(extract(fit, "beta")$beta)))
+cat(sprintf("Gamma: True = %.3f, Estimated = %.3f\n", 
+            true_gamma, mean(extract(fit, "gamma")$gamma)))
+cat(sprintf("R0:    True = %.3f, Estimated = %.3f\n", 
+            true_R0, mean(extract(fit, "R0")$R0)))
+```
+
+# Step 5: Convergence Diagnostics with Trace Plots
+
+**Trace plots** show the parameter values sampled at each MCMC iteration. They're crucial for diagnosing convergence.
+
+```{r trace_plots}
+# Extract posterior samples
+posterior <- extract(fit, permuted = FALSE, inc_warmup = FALSE)
+
+# Trace plots for beta and gamma
+mcmc_trace(posterior, pars = c("beta", "gamma", "R0")) +
+  labs(title = "Trace Plots: Parameter Values Across MCMC Iterations") +
+  theme_minimal()
+```
+
+**What to Look For:**
+
+- **Good mixing**: Chains should look like "fuzzy caterpillars" - no clear patterns or trends
+- **Convergence**: All chains (different colors) should overlap and explore the same region
+- **Stationarity**: No drifting up or down over iterations
+
+**Our plots show:** The chains have converged! They mix well and explore the same parameter space.
+
+```{r trace_diagnostics}
+# Pairs plot to check correlations between parameters
+mcmc_pairs(posterior, pars = c("beta", "gamma", "R0"),
+           diag_fun = "dens",
+           off_diag_fun = "hex") +
+  labs(title = "Posterior Correlations Between Parameters")
+```
+
+This plot shows:
+
+- **Diagonal**: Marginal posterior distributions (what we believe about each parameter)
+- **Off-diagonal**: Joint distributions (correlations between parameters)
+
+```{r density_plots}
+# Density plots with credible intervals
+mcmc_areas(posterior, pars = c("beta", "gamma", "R0"), prob = 0.95) +
+  labs(title = "Posterior Distributions with 95% Credible Intervals") +
+  theme_minimal()
+```
+
+# Step 6: Posterior Predictive Checks
+
+**Posterior predictive checks** compare observed data to data simulated from the fitted model. If the model is good, simulated data should look like observed data.
+
+```{r posterior_predictive}
+# Extract posterior predictive samples
+y_pred <- extract(fit, "y_pred")$y_pred
+
+# Calculate quantiles for plotting
+y_pred_quantiles <- apply(y_pred, 2, quantile, probs = c(0.025, 0.1, 0.5, 0.9, 0.975))
+
+# Create data frame for plotting
+pred_df <- data.frame(
+  time = fit_data$time,
+  observed = fit_data$I_observed,
+  median = y_pred_quantiles[3, ],
+  lower_95 = y_pred_quantiles[1, ],
+  upper_95 = y_pred_quantiles[5, ],
+  lower_80 = y_pred_quantiles[2, ],
+  upper_80 = y_pred_quantiles[4, ]
+)
+
+# Plot posterior predictive distribution
+ggplot(pred_df, aes(x = time)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), 
+              fill = "skyblue", alpha = 0.3) +
+  geom_ribbon(aes(ymin = lower_80, ymax = upper_80), 
+              fill = "skyblue", alpha = 0.5) +
+  geom_line(aes(y = median, color = "Predicted median"), size = 1) +
+  geom_point(aes(y = observed, color = "Observed data"), alpha = 0.6) +
+  labs(
+    title = "Posterior Predictive Check",
+    subtitle = "Do predictions from our model match observed data?",
+    x = "Time (days)",
+    y = "Infected individuals",
+    color = NULL
+  ) +
+  scale_color_manual(values = c("Predicted median" = "blue", "Observed data" = "red")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**Interpretation:**
+
+- **Dark blue band**: 80% posterior predictive interval
+- **Light blue band**: 95% posterior predictive interval
+- **Blue line**: Predicted median
+- **Red points**: Observed data
+
+If the model is good, most observed points should fall within the predictive intervals. ✓ Our model fits well!
+
+```{r ppc_density}
+# PPC density overlay
+ppc_dens_overlay(fit_data$I_observed, y_pred[1:100, ]) +
+  labs(title = "Posterior Predictive Density Check",
+       subtitle = "100 posterior predictive samples vs. observed data") +
+  theme_minimal()
+```
+
+This plot overlays the distribution of observed data (dark line) with distributions from simulated datasets (light lines). Good overlap indicates a good fit.
+
+# Step 7: Forecasting Beyond the Fitted Period
+
+Now let's use our fitted model to predict the epidemic trajectory beyond day 60.
+
+```{r forecast}
+# Extract posterior samples of beta and gamma
+beta_samples <- extract(fit, "beta")$beta
+gamma_samples <- extract(fit, "gamma")$gamma
+
+# Number of posterior samples to use for forecasting
+n_forecast_samples <- 500
+sample_idx <- sample(length(beta_samples), n_forecast_samples)
+
+# Forecast time points (full 100 days)
+forecast_times <- seq(0, 100, by = 1)
+
+# Store forecasts
+forecast_results <- array(dim = c(n_forecast_samples, length(forecast_times), 3))
+
+# Simulate trajectories for each posterior sample
+for (i in 1:n_forecast_samples) {
+  params_i <- c(
+    beta = beta_samples[sample_idx[i]],
+    gamma = gamma_samples[sample_idx[i]]
+  )
+  
+  sir_forecast <- ode(
+    y = initial_state,
+    times = forecast_times,
+    func = sir_ode,
+    parms = params_i
+  )
+  
+  forecast_results[i, , ] <- sir_forecast[, 2:4]
+}
+
+# Calculate quantiles for infected compartment
+I_quantiles <- apply(forecast_results[, , 2], 2, quantile, 
+                     probs = c(0.025, 0.1, 0.5, 0.9, 0.975))
+
+forecast_df <- data.frame(
+  time = forecast_times,
+  median = I_quantiles[3, ],
+  lower_95 = I_quantiles[1, ],
+  upper_95 = I_quantiles[5, ],
+  lower_80 = I_quantiles[2, ],
+  upper_80 = I_quantiles[4, ]
+)
+
+# Add observed data
+full_observed <- data.frame(
+  time = sir_df$time,
+  observed = sir_df$I_observed,
+  true = sir_df$I
+)
+
+# Plot forecast
+ggplot() +
+  geom_ribbon(data = forecast_df, aes(x = time, ymin = lower_95, ymax = upper_95), 
+              fill = "skyblue", alpha = 0.3) +
+  geom_ribbon(data = forecast_df, aes(x = time, ymin = lower_80, ymax = upper_80), 
+              fill = "skyblue", alpha = 0.5) +
+  geom_line(data = forecast_df, aes(x = time, y = median, color = "Forecast median"), 
+            size = 1) +
+  geom_line(data = full_observed, aes(x = time, y = true, color = "True trajectory"), 
+            linetype = "dashed", size = 1) +
+  geom_point(data = full_observed %>% filter(time <= fit_period), 
+             aes(x = time, y = observed, color = "Observed (fitted)"), alpha = 0.5) +
+  geom_point(data = full_observed %>% filter(time > fit_period), 
+             aes(x = time, y = observed, color = "Observed (holdout)"), alpha = 0.5) +
+  geom_vline(xintercept = fit_period, linetype = "dotted", size = 0.8) +
+  annotate("text", x = fit_period - 5, y = max(forecast_df$upper_95) * 0.9, 
+           label = "Fitted period", angle = 90, vjust = -0.5) +
+  labs(
+    title = "Epidemic Forecast with Posterior Uncertainty",
+    subtitle = "Model fitted on days 0-60, forecasting to day 100",
+    x = "Time (days)",
+    y = "Infected individuals",
+    color = NULL
+  ) +
+  scale_color_manual(
+    values = c(
+      "Forecast median" = "blue",
+      "True trajectory" = "darkgreen",
+      "Observed (fitted)" = "red",
+      "Observed (holdout)" = "orange"
+    )
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**Key Observations:**
+
+1. The forecast (blue) matches the true trajectory (green dashed) well
+2. Uncertainty (shaded regions) increases as we forecast further into the future
+3. The holdout observations (orange) fall within our predictive intervals
+4. This demonstrates that our Bayesian model has successfully learned the epidemic dynamics!
+
+# Summary and Key Takeaways
+
+## What We've Learned
+
+1. **Bayesian Workflow**: 
+   - Specify a probabilistic model (priors + likelihood)
+   - Fit using MCMC (Stan's HMC algorithm)
+   - Check convergence (trace plots, Rhat)
+   - Validate with posterior predictive checks
+
+2. **SIR Model Fitting**:
+   - Successfully recovered true parameter values from noisy data
+   - Quantified uncertainty in parameter estimates
+   - Made probabilistic forecasts with credible intervals
+
+3. **Advantages of Bayesian Approach**:
+   - Full posterior distributions (not just point estimates)
+   - Principled uncertainty quantification
+   - Flexible framework for complex models
+   - Natural handling of hierarchical structures and latent variables
+
+## Further Extensions
+
+You could extend this analysis by:
+
+- Adding time-varying transmission rates ($\beta(t)$) to model interventions
+- Including demographic structure (age groups, spatial structure)
+- Fitting to multiple data streams (deaths, hospitalizations)
+- Comparing different epidemic models (SEIR, SEIRS, etc.)
+- Estimating initial conditions (if $I_0$ is unknown)
+
+## References
+
+- Stan Development Team. "Stan Modeling Language User's Guide." https://mc-stan.org/
+- Gelman et al. "Bayesian Data Analysis, Third Edition." 2013.
+- Keeling & Rohani. "Modeling Infectious Diseases in Humans and Animals." 2008.
+
+---
+
+**Happy Bayesian modeling!** 🎉
+

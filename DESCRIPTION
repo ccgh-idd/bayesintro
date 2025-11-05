@@ -1,0 +1,25 @@
+Package: bayesintro
+Title: Introduction to Bayesian Inference with Epidemiological Models
+Version: 0.0.0.9000
+Authors@R: 
+    person("First", "Last", , "first.last@example.com", role = c("aut", "cre"))
+Description: Educational materials for an introductory course on Bayesian inference,
+    featuring worked examples with epidemiological SIR models.
+License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a
+    license
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Suggests:
+    knitr,
+    rmarkdown,
+    rstan,
+    BayesianTools,
+    coda,
+    ggplot2,
+    dplyr,
+    tidyr,
+    bayesplot,
+    posterior,
+    deSolve
+VignetteBuilder: knitr

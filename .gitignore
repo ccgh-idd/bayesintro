@@ -1,0 +1,20 @@
+# R
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Stan
+*.rds
+*.stan.o
+
+# Vignettes
+vignettes/*.html
+vignettes/*.R
+inst/doc/
+
+# Build files
+*.tar.gz
+*.zip
+

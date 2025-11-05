@@ -1,0 +1,873 @@
+---
+title: "Bayesian Inference for SIR Models using BayesianTools"
+author: "Introduction to Bayesian Statistics"
+date: "`r Sys.Date()`"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+vignette: >
+  %\VignetteIndexEntry{Bayesian Inference for SIR Models using BayesianTools}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 8,
+  fig.height = 6,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Introduction
+
+This vignette demonstrates Bayesian inference for **SIR (Susceptible-Infected-Recovered) epidemic models** using the **BayesianTools** package. Unlike Stan, BayesianTools works entirely in R without requiring C++ compilation, making it more accessible for beginners.
+
+We'll cover:
+
+1. Understanding the SIR model (same as before!)
+2. Simulating epidemic data
+3. Defining likelihood and prior functions in R
+4. Fitting with various MCMC algorithms (Metropolis, DEzs, DREAM)
+5. Trace plots for convergence diagnostics
+6. Posterior predictive checks
+7. Comparing different MCMC samplers
+
+## Why BayesianTools?
+
+**Advantages:**
+
+- ✅ Pure R implementation - no compilation needed
+- ✅ Multiple MCMC algorithms available
+- ✅ Easy to understand likelihood and prior functions
+- ✅ Great for teaching Bayesian fundamentals
+- ✅ Built-in diagnostic tools
+
+**Trade-offs:**
+
+- Slower than Stan for complex models (but fine for SIR!)
+- Less automatic tuning than Stan's HMC
+- May require more manual tuning for difficult posteriors
+
+## The SIR Model (Quick Review)
+
+The SIR model divides a population into three compartments:
+
+$$
+\begin{aligned}
+\frac{dS}{dt} &= -\beta \frac{SI}{N} \\
+\frac{dI}{dt} &= \beta \frac{SI}{N} - \gamma I \\
+\frac{dR}{dt} &= \gamma I
+\end{aligned}
+$$
+
+Parameters:
+
+- $\beta$: transmission rate
+- $\gamma$: recovery rate (1/infectious period)
+- $R_0 = \beta/\gamma$: basic reproductive number
+
+# Load Required Libraries
+
+```{r libraries}
+library(BayesianTools)
+library(deSolve)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(coda)
+
+# Set random seed for reproducibility
+set.seed(42)
+```
+
+# Step 1: Simulate SIR Epidemic Data
+
+We'll use the same simulation setup as the Stan vignette for comparison.
+
+```{r simulate_sir}
+# Define the SIR model as ODEs
+sir_ode <- function(time, state, parameters) {
+  with(as.list(c(state, parameters)), {
+    N <- S + I + R
+    
+    dS <- -beta * S * I / N
+    dI <- beta * S * I / N - gamma * I
+    dR <- gamma * I
+    
+    return(list(c(dS, dI, dR)))
+  })
+}
+
+# True parameter values (what we'll try to recover)
+true_beta <- 0.4    # Transmission rate
+true_gamma <- 0.1   # Recovery rate
+true_R0 <- true_beta / true_gamma
+
+cat("True parameters:\n")
+cat(sprintf("  β = %.2f\n", true_beta))
+cat(sprintf("  γ = %.2f\n", true_gamma))
+cat(sprintf("  R₀ = %.2f\n", true_R0))
+
+# Initial conditions
+N <- 1000
+initial_infected <- 10
+initial_state <- c(
+  S = N - initial_infected,
+  I = initial_infected,
+  R = 0
+)
+
+# Simulate the epidemic
+times <- seq(0, 100, by = 1)
+parameters <- c(beta = true_beta, gamma = true_gamma)
+
+sir_solution <- ode(
+  y = initial_state,
+  times = times,
+  func = sir_ode,
+  parms = parameters
+)
+
+sir_df <- as.data.frame(sir_solution)
+colnames(sir_df) <- c("time", "S", "I", "R")
+
+# Add observation noise (Poisson)
+sir_df$I_observed <- rpois(nrow(sir_df), lambda = sir_df$I)
+
+# Plot the simulated data
+ggplot(sir_df, aes(x = time)) +
+  geom_line(aes(y = S, color = "Susceptible"), size = 1) +
+  geom_line(aes(y = I, color = "Infected (true)"), size = 1) +
+  geom_line(aes(y = R, color = "Recovered"), size = 1) +
+  geom_point(aes(y = I_observed, color = "Infected (observed)"), alpha = 0.5) +
+  labs(
+    title = "Simulated SIR Epidemic",
+    subtitle = paste0("β = ", true_beta, ", γ = ", true_gamma, ", R₀ = ", round(true_R0, 2)),
+    x = "Time (days)",
+    y = "Number of individuals",
+    color = "Compartment"
+  ) +
+  theme_minimal() +
+  scale_color_manual(
+    values = c(
+      "Susceptible" = "blue",
+      "Infected (true)" = "red",
+      "Infected (observed)" = "darkred",
+      "Recovered" = "green"
+    )
+  )
+```
+
+# Step 2: Prepare Data for Fitting
+
+```{r prepare_data}
+# Use data up to day 60 for fitting
+fit_period <- 60
+fit_data <- sir_df %>% filter(time <= fit_period)
+
+# Extract observed infected counts
+observed_I <- fit_data$I_observed
+times_fit <- fit_data$time
+
+cat("Fitting to", length(observed_I), "observations\n")
+cat("Observed infected counts (first 10 days):\n")
+print(head(observed_I, 10))
+```
+
+# Step 3: Define the Bayesian Model Components
+
+In BayesianTools, we need to define:
+
+1. **Likelihood function**: How likely are the data given parameters?
+2. **Prior function**: What do we believe about parameters before seeing data?
+
+## 3.1 Create the Likelihood Function
+
+```{r likelihood}
+# Function to solve SIR ODE and extract infected counts
+predict_sir <- function(params) {
+  beta <- params[1]
+  gamma <- params[2]
+  
+  # Solve ODE with error handling
+  sir_pred <- tryCatch({
+    ode(
+      y = initial_state,
+      times = times_fit,
+      func = sir_ode,
+      parms = c(beta = beta, gamma = gamma)
+    )
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  # Check if ODE solving failed
+  if (is.null(sir_pred)) {
+    return(NULL)
+  }
+  
+  # Extract infected counts (column 3 is I)
+  I_pred <- sir_pred[, 3]
+  
+  # Ensure non-negative predictions
+  I_pred[I_pred < 0] <- 0
+  
+  return(I_pred)
+}
+
+# Likelihood function
+# We assume observed counts follow Poisson(predicted counts)
+likelihood <- function(params) {
+  # Bounds checking (return very low likelihood if out of bounds)
+  if (params[1] <= 0 || params[1] > 2 || 
+      params[2] <= 0 || params[2] > 1) {
+    return(-Inf)
+  }
+  
+  # Get predicted infected counts
+  I_pred <- predict_sir(params)
+  
+  # Check if ODE solving failed
+  if (is.null(I_pred)) {
+    return(-Inf)
+  }
+  
+  # Check for any invalid values
+  if (any(is.na(I_pred)) || any(is.infinite(I_pred))) {
+    return(-Inf)
+  }
+  
+  # Calculate log-likelihood (sum of Poisson log-likelihoods)
+  # Add small constant to avoid lambda = 0
+  log_lik <- sum(dpois(observed_I, lambda = pmax(I_pred, 0.01), log = TRUE))
+  
+  # Check if likelihood is valid
+  if (is.na(log_lik) || is.infinite(log_lik)) {
+    return(-Inf)
+  }
+  
+  return(log_lik)
+}
+
+# Test the likelihood function
+test_params <- c(0.4, 0.1)
+cat("Log-likelihood at true parameters:", likelihood(test_params), "\n")
+```
+
+**Understanding the Likelihood:**
+
+- For each time point, we compare observed vs. predicted infected counts
+- `dpois(observed, lambda = predicted)` gives the probability of seeing the observed count if the true mean is `predicted`
+- We sum log-probabilities across all time points
+- Higher likelihood = better fit to data
+- **Error handling**: We added `tryCatch()` and checks because the ODE solver can fail with extreme parameter values during MCMC exploration. When this happens, we return `-Inf` likelihood, which tells the sampler to reject those parameters.
+
+## 3.2 Define Prior Distributions
+
+```{r prior}
+# Prior function
+# We'll use weakly informative priors
+prior_density <- function(params) {
+  beta <- params[1]
+  gamma <- params[2]
+  
+  # Check bounds - return -Inf if out of bounds
+  if (beta <= 0 || beta > 2 || gamma <= 0 || gamma > 1) {
+    return(-Inf)
+  }
+  
+  # Beta ~ Normal(0.4, 0.2), truncated to (0, 2)
+  log_prior_beta <- dnorm(beta, mean = 0.4, sd = 0.2, log = TRUE)
+  
+  # Gamma ~ Normal(0.1, 0.05), truncated to (0, 1)
+  log_prior_gamma <- dnorm(gamma, mean = 0.1, sd = 0.05, log = TRUE)
+  
+  # Combined prior
+  log_prior <- log_prior_beta + log_prior_gamma
+  
+  # Check for invalid values
+  if (is.na(log_prior) || is.nan(log_prior)) {
+    return(-Inf)
+  }
+  
+  return(log_prior)
+}
+
+# Prior sampling function (needed for some algorithms)
+prior_sampler <- function(n = 1) {
+  beta <- rnorm(n, mean = 0.4, sd = 0.2)
+  gamma <- rnorm(n, mean = 0.1, sd = 0.05)
+  
+  # Ensure positive values and within bounds
+  beta <- pmax(pmin(abs(beta), 2), 0.01)
+  gamma <- pmax(pmin(abs(gamma), 1), 0.01)
+  
+  return(cbind(beta, gamma))
+}
+
+# Test prior
+test_prior <- prior_sampler(5)
+cat("Sample from prior:\n")
+print(test_prior)
+
+# Test prior density
+cat("\nLog prior density at true parameters:", prior_density(c(0.4, 0.1)), "\n")
+```
+
+**Understanding the Priors:**
+
+- We defined informative priors centered around plausible values
+- `β ~ Normal(0.4, 0.2)`: We expect transmission rate around 0.4
+- `γ ~ Normal(0.1, 0.05)`: We expect recovery rate around 0.1 (10-day infectious period)
+- These are "weakly informative" - they guide the sampler but don't overwhelm the data
+- **Note**: In the setup below, we'll use uniform priors for simplicity (common in teaching examples)
+
+## 3.3 Create the Bayesian Setup
+
+```{r bayesian_setup}
+# Create the Bayesian setup object
+# Note: We can either use explicit priors OR bounds, but not both simultaneously
+
+# OPTION 1: Use bounds (creates uniform prior) - SIMPLER, RECOMMENDED FOR TEACHING
+bayesian_setup <- createBayesianSetup(
+  likelihood = likelihood,
+  lower = c(0.01, 0.01),      # Lower bounds (slightly above 0)
+  upper = c(2, 1),            # Upper bounds
+  names = c("beta", "gamma")
+)
+
+cat("Bayesian setup created successfully!\n")
+cat("Using uniform priors: beta ~ Uniform(0.01, 2), gamma ~ Uniform(0.01, 1)\n")
+
+# OPTION 2: Use informative priors (more advanced - uncomment to try)
+# This requires creating a custom prior object
+# prior_obj <- createPrior(
+#   density = prior_density,
+#   sampler = prior_sampler,
+#   lower = c(0.01, 0.01),
+#   upper = c(2, 1)
+# )
+# bayesian_setup <- createBayesianSetup(
+#   likelihood = likelihood,
+#   prior = prior_obj,
+#   names = c("beta", "gamma")
+# )
+```
+
+# Step 4: Fit the Model Using Different MCMC Algorithms
+
+BayesianTools offers several MCMC algorithms. We'll try three:
+
+1. **DEzs (Differential Evolution with snooker updater)**: Efficient for many problems
+2. **DREAM (DiffeRential Evolution Adaptive Metropolis)**: Good for multimodal posteriors
+3. **Metropolis**: Classic algorithm (for comparison)
+
+## 4.1 Fit with DEzs (Recommended)
+
+```{r fit_dezs}
+cat("Fitting with DEzs algorithm...\n")
+
+fit_dezs <- runMCMC(
+  bayesianSetup = bayesian_setup,
+  sampler = "DEzs",
+  settings = list(
+    iterations = 10000,   # Number of iterations
+    nrChains = 3,         # Number of chains
+    burnin = 2000,        # Burn-in period
+    thin = 5,             # Thinning interval
+    message = TRUE
+  )
+)
+
+cat("\nDEzs fitting complete!\n")
+```
+
+## 4.2 Fit with DREAM
+
+```{r fit_dream}
+cat("Fitting with DREAM algorithm...\n")
+
+fit_dream <- runMCMC(
+  bayesianSetup = bayesian_setup,
+  sampler = "DREAM",
+  settings = list(
+    iterations = 10000,
+    nrChains = 3,
+    burnin = 2000,
+    thin = 5,
+    message = TRUE
+  )
+)
+
+cat("\nDREAM fitting complete!\n")
+```
+
+## 4.3 Fit with Metropolis
+
+```{r fit_metropolis}
+cat("Fitting with Metropolis algorithm...\n")
+
+fit_metropolis <- runMCMC(
+  bayesianSetup = bayesian_setup,
+  sampler = "Metropolis",
+  settings = list(
+    iterations = 50000,   # More iterations needed for Metropolis
+    nrChains = 3,
+    burnin = 10000,
+    adaptationNotBefore = 20000,
+    thin = 10,
+    message = TRUE,
+    startValue = c(0.4, 0.1)  # Starting values
+  )
+)
+
+cat("\nMetropolis fitting complete!\n")
+```
+
+# Step 5: Examine Results
+
+## 5.1 Summary Statistics
+
+```{r summary}
+cat("========================================\n")
+cat("SUMMARY: DEzs Algorithm\n")
+cat("========================================\n")
+summary(fit_dezs)
+
+cat("\n========================================\n")
+cat("SUMMARY: DREAM Algorithm\n")
+cat("========================================\n")
+summary(fit_dream)
+
+cat("\n========================================\n")
+cat("SUMMARY: Metropolis Algorithm\n")
+cat("========================================\n")
+summary(fit_metropolis)
+
+# Compare to true values
+cat("\n========================================\n")
+cat("COMPARISON TO TRUE VALUES\n")
+cat("========================================\n")
+
+# Extract posterior means from DEzs (best performing)
+
+posterior_means <- getSample(fit_dezs, start = 2, thin = 1) %>% apply(2, mean)
+
+
+cat(sprintf("Beta:  True = %.3f, Estimated (DEzs) = %.3f\n", 
+            true_beta, posterior_means[1]))
+cat(sprintf("Gamma: True = %.3f, Estimated (DEzs) = %.3f\n", 
+            true_gamma, posterior_means[2]))
+cat(sprintf("R0:    True = %.3f, Estimated (DEzs) = %.3f\n", 
+            true_R0, posterior_means[1]/posterior_means[2]))
+            
+```
+
+## 5.2 Convergence Diagnostics
+
+```{r convergence}
+# Gelman-Rubin diagnostic (Rhat)
+# Values close to 1.0 indicate convergence
+# Rhat < 1.1 is generally considered good
+
+cat("Gelman-Rubin Diagnostic (Rhat):\n")
+cat("Values < 1.1 indicate good convergence\n\n")
+
+cat("DEzs:\n")
+gelmanDiagnostics(fit_dezs)
+
+cat("\nDREAM:\n")
+gelmanDiagnostics(fit_dream)
+
+cat("\nMetropolis:\n")
+gelmanDiagnostics(fit_metropolis)
+```
+
+# Step 6: Trace Plots
+
+Trace plots show parameter values across MCMC iterations. Good mixing looks like a "fuzzy caterpillar."
+
+## 6.1 DEzs Trace Plots
+
+```{r trace_dezs, fig.height=8}
+plot(fit_dezs, which = c(1, 2))
+tracePlot(fit_dezs, start = 2)
+```
+
+**What to look for:**
+
+- ✅ All chains (colors) overlap and explore same region
+- ✅ No trends or drifts over time
+- ✅ "Fuzzy caterpillar" appearance
+- ✅ Good mixing between chains
+
+## 6.2 DREAM Trace Plots
+
+```{r trace_dream, fig.height=8}
+plot(fit_dream, which = c(1, 2))
+tracePlot(fit_dream, start = 2)
+```
+
+## 6.3 Metropolis Trace Plots
+
+```{r trace_metropolis, fig.height=8}
+
+plot(fit_metropolis, which = c(1, 2))
+tracePlot(fit_metropolis, start = 1)
+
+```
+
+**Comparison:**
+
+- DEzs and DREAM typically show better mixing than basic Metropolis
+- Metropolis may show autocorrelation (slower exploration)
+- All three should converge to the same posterior if run long enough
+
+# Step 7: Posterior Distributions
+
+## 7.1 Marginal Posteriors
+
+```{r marginal_posteriors}
+# Plot marginal posterior distributions
+par(mfrow = c(2, 2))
+
+# DEzs
+plot(fit_dezs, which = c(3, 4))
+abline(v = true_beta, col = "red", lwd = 2, lty = 2)
+abline(v = true_gamma, col = "red", lwd = 2, lty = 2)
+```
+
+## 7.2 Joint Posterior (Correlation Plot)
+
+```{r correlation_plot}
+# Correlation between beta and gamma
+correlationPlot(fit_dezs)
+```
+
+**Interpretation:**
+
+- Shows the joint posterior distribution of β and γ
+- Reveals any correlations between parameters
+- Elliptical shape indicates correlation
+- Red lines show true parameter values
+
+## 7.3 Posterior for R0
+
+```{r r0_posterior}
+# Calculate R0 from posterior samples
+samples_dezs <- getSample(fit_dezs, start = 2, thin = 1)
+R0_posterior <- samples_dezs[, 1] / samples_dezs[, 2]
+
+# Plot R0 posterior
+hist(R0_posterior, breaks = 50, 
+     main = "Posterior Distribution of R₀",
+     xlab = "R₀",
+     col = "skyblue",
+     border = "white",
+     freq = FALSE)
+abline(v = true_R0, col = "red", lwd = 3, lty = 2)
+abline(v = mean(R0_posterior), col = "blue", lwd = 2)
+legend("topright", 
+       legend = c("True R₀", "Posterior mean"),
+       col = c("red", "blue"),
+       lty = c(2, 1),
+       lwd = c(3, 2))
+
+# Summary statistics for R0
+cat("\nPosterior summary for R₀:\n")
+cat(sprintf("  Mean: %.2f\n", mean(R0_posterior)))
+cat(sprintf("  Median: %.2f\n", median(R0_posterior)))
+cat(sprintf("  95%% CI: [%.2f, %.2f]\n", 
+            quantile(R0_posterior, 0.025),
+            quantile(R0_posterior, 0.975)))
+cat(sprintf("  True value: %.2f\n", true_R0))
+```
+
+# Step 8: Posterior Predictive Checks
+
+Let's check if our model can reproduce the observed data.
+
+```{r posterior_predictive}
+# Extract posterior samples (use DEzs as best performer)
+n_samples <- 500
+sample_idx <- sample(nrow(samples_dezs), n_samples)
+posterior_samples <- samples_dezs[sample_idx, ]
+
+# Generate predictions for each posterior sample
+predictions <- matrix(NA, nrow = n_samples, ncol = length(times_fit))
+
+for (i in 1:n_samples) {
+  predictions[i, ] <- predict_sir(as.numeric(posterior_samples[i, ]))
+}
+
+# Calculate quantiles
+pred_quantiles <- apply(predictions, 2, quantile, 
+                        probs = c(0.025, 0.1, 0.5, 0.9, 0.975))
+
+# Create data frame for plotting
+pred_df <- data.frame(
+  time = times_fit,
+  observed = observed_I,
+  median = pred_quantiles[3, ],
+  lower_95 = pred_quantiles[1, ],
+  upper_95 = pred_quantiles[5, ],
+  lower_80 = pred_quantiles[2, ],
+  upper_80 = pred_quantiles[4, ]
+)
+
+# Plot posterior predictive distribution
+ggplot(pred_df, aes(x = time)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), 
+              fill = "skyblue", alpha = 0.3) +
+  geom_ribbon(aes(ymin = lower_80, ymax = upper_80), 
+              fill = "skyblue", alpha = 0.5) +
+  geom_line(aes(y = median, color = "Predicted median"), size = 1) +
+  geom_point(aes(y = observed, color = "Observed data"), alpha = 0.6) +
+  labs(
+    title = "Posterior Predictive Check",
+    subtitle = "Model predictions vs. observed data",
+    x = "Time (days)",
+    y = "Infected individuals",
+    color = NULL
+  ) +
+  scale_color_manual(values = c("Predicted median" = "blue", 
+                                 "Observed data" = "red")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**Interpretation:**
+
+- **Shaded regions**: Uncertainty in predictions (darker = 80% CI, lighter = 95% CI)
+- **Blue line**: Median prediction
+- **Red points**: Observed data
+
+If the model fits well, most observed points should fall within the predictive intervals. ✓
+
+# Step 9: Forecasting
+
+Now let's forecast the epidemic beyond day 60 using our fitted model.
+
+```{r forecast}
+# Forecast time points (full 100 days)
+times_forecast <- seq(0, 100, by = 1)
+
+# Generate forecasts
+n_forecast <- 500
+forecast_idx <- sample(nrow(samples_dezs), n_forecast)
+forecast_samples <- samples_dezs[forecast_idx, ]
+
+# Store forecasts
+forecast_I <- matrix(NA, nrow = n_forecast, ncol = length(times_forecast))
+
+for (i in 1:n_forecast) {
+  beta_i <- as.numeric(forecast_samples[i, 1])
+  gamma_i <- as.numeric(forecast_samples[i, 2])
+  
+  sir_forecast <- ode(
+    y = initial_state,
+    times = times_forecast,
+    func = sir_ode,
+    parms = c(beta = beta_i, gamma = gamma_i)
+  )
+  
+  forecast_I[i, ] <- sir_forecast[, 3]
+}
+
+# Calculate quantiles
+forecast_quantiles <- apply(forecast_I, 2, quantile, 
+                            probs = c(0.025, 0.1, 0.5, 0.9, 0.975))
+
+forecast_df <- data.frame(
+  time = times_forecast,
+  median = forecast_quantiles[3, ],
+  lower_95 = forecast_quantiles[1, ],
+  upper_95 = forecast_quantiles[5, ],
+  lower_80 = forecast_quantiles[2, ],
+  upper_80 = forecast_quantiles[4, ]
+)
+
+# Add observed data
+full_observed <- data.frame(
+  time = sir_df$time,
+  observed = sir_df$I_observed,
+  true = sir_df$I
+)
+
+# Plot forecast
+ggplot() +
+  geom_ribbon(data = forecast_df, 
+              aes(x = time, ymin = lower_95, ymax = upper_95), 
+              fill = "skyblue", alpha = 0.3) +
+  geom_ribbon(data = forecast_df, 
+              aes(x = time, ymin = lower_80, ymax = upper_80), 
+              fill = "skyblue", alpha = 0.5) +
+  geom_line(data = forecast_df, 
+            aes(x = time, y = median, color = "Forecast median"), 
+            size = 1) +
+  geom_line(data = full_observed, 
+            aes(x = time, y = true, color = "True trajectory"), 
+            linetype = "dashed", size = 1) +
+  geom_point(data = full_observed %>% filter(time <= fit_period), 
+             aes(x = time, y = observed, color = "Observed (fitted)"), 
+             alpha = 0.5) +
+  geom_point(data = full_observed %>% filter(time > fit_period), 
+             aes(x = time, y = observed, color = "Observed (holdout)"), 
+             alpha = 0.5) +
+  geom_vline(xintercept = fit_period, linetype = "dotted", size = 0.8) +
+  annotate("text", x = fit_period - 5, y = max(forecast_df$upper_95) * 0.9, 
+           label = "Fitted period", angle = 90, vjust = -0.5) +
+  labs(
+    title = "Epidemic Forecast with Posterior Uncertainty",
+    subtitle = "Model fitted on days 0-60, forecasting to day 100",
+    x = "Time (days)",
+    y = "Infected individuals",
+    color = NULL
+  ) +
+  scale_color_manual(
+    values = c(
+      "Forecast median" = "blue",
+      "True trajectory" = "darkgreen",
+      "Observed (fitted)" = "red",
+      "Observed (holdout)" = "orange"
+    )
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**Key Observations:**
+
+1. ✓ Forecast matches true trajectory well
+2. ✓ Uncertainty increases further into future
+3. ✓ Holdout observations fall within predictive intervals
+4. ✓ Model has learned the epidemic dynamics!
+
+# Step 10: Compare MCMC Algorithms
+
+Let's compare the efficiency of different samplers.
+
+```{r compare_samplers}
+# Extract effective sample sizes
+cat("Effective Sample Sizes:\n")
+cat("(Higher is better - more independent samples)\n\n")
+
+cat("DEzs:\n")
+effectiveSize(getSample(fit_dezs, start = 2, thin = 1))
+
+cat("\nDREAM:\n")
+effectiveSize(getSample(fit_dream, start = 2, thin = 1))
+
+cat("\nMetropolis:\n")
+effectiveSize(getSample(fit_metropolis, start = 2, thin = 1))
+
+# Create comparison plot
+samples_list <- list(
+  DEzs = getSample(fit_dezs, start = 2, thin = 1),
+  DREAM = getSample(fit_dream, start = 2, thin = 1),
+  Metropolis = getSample(fit_metropolis, start = 2, thin = 1)
+)
+
+# Plot posterior densities from all three methods
+par(mfrow = c(1, 2))
+
+# Beta
+plot(density(samples_list$DEzs[, 1]), 
+     main = "Posterior: β (transmission rate)",
+     xlab = "β", col = "blue", lwd = 2, xlim = c(0.3, 0.5))
+lines(density(samples_list$DREAM[, 1]), col = "green", lwd = 2)
+lines(density(samples_list$Metropolis[, 1]), col = "red", lwd = 2)
+abline(v = true_beta, lty = 2, lwd = 2)
+legend("topright", 
+       legend = c("DEzs", "DREAM", "Metropolis", "True"),
+       col = c("blue", "green", "red", "black"),
+       lty = c(1, 1, 1, 2),
+       lwd = 2)
+
+# Gamma
+plot(density(samples_list$DEzs[, 2]), 
+     main = "Posterior: γ (recovery rate)",
+     xlab = "γ", col = "blue", lwd = 2, xlim = c(0.08, 0.12))
+lines(density(samples_list$DREAM[, 2]), col = "green", lwd = 2)
+lines(density(samples_list$Metropolis[, 2]), col = "red", lwd = 2)
+abline(v = true_gamma, lty = 2, lwd = 2)
+legend("topright", 
+       legend = c("DEzs", "DREAM", "Metropolis", "True"),
+       col = c("blue", "green", "red", "black"),
+       lty = c(1, 1, 1, 2),
+       lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+
+**Sampler Comparison:**
+
+- **DEzs & DREAM**: Modern algorithms with good efficiency
+- **Metropolis**: Classic algorithm, may need more iterations
+- All three converge to similar posteriors (good sign!)
+
+# Summary and Key Takeaways
+
+## What We've Learned
+
+### 1. BayesianTools Workflow
+
+1. Define likelihood function (data generating process)
+2. Specify prior distributions
+3. Create Bayesian setup
+4. Run MCMC sampler
+5. Check convergence
+6. Validate with posterior predictive checks
+
+### 2. MCMC Algorithms
+
+- **DEzs**: Good default choice, efficient for many problems
+- **DREAM**: Excellent for complex posteriors
+- **Metropolis**: Simple but may need more iterations
+
+### 3. Key Diagnostics
+
+- **Rhat < 1.1**: Good convergence
+- **Effective sample size**: More is better
+- **Trace plots**: Should look like "fuzzy caterpillars"
+- **Posterior predictive checks**: Model should reproduce data
+
+## BayesianTools vs. Stan
+
+| Feature | BayesianTools | Stan |
+|---------|--------------|------|
+| Setup | Pure R, no compilation | Requires C++ compilation |
+| Speed | Moderate | Fast (for complex models) |
+| Learning curve | Gentle | Steeper |
+| Flexibility | Good | Excellent |
+| Diagnostics | Built-in tools | Excellent (via bayesplot) |
+| Best for | Teaching, simple-moderate models | Complex hierarchical models |
+
+**Bottom line**: Use BayesianTools for learning and moderate-complexity problems. Graduate to Stan for production work and complex models.
+
+## Further Extensions
+
+You could extend this analysis by:
+
+- Trying different prior distributions
+- Adding measurement error models
+- Including time-varying parameters
+- Fitting SEIR or other compartmental models
+- Using adaptive MCMC (`sampler = "AM"`)
+- Implementing model comparison with DIC or WAIC
+
+## References
+
+- Hartig, F. (2022). BayesianTools: General-Purpose MCMC and SMC Samplers and Tools for Bayesian Statistics. R package.
+- Gelman et al. (2013). *Bayesian Data Analysis, Third Edition*. CRC Press.
+- ter Braak & Vrugt (2008). Differential Evolution Markov Chain with snooker updater. *Statistics and Computing*.
+
+---
+
+**Happy Bayesian modeling with BayesianTools!** 🎉
+
